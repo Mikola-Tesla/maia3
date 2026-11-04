@@ -74,6 +74,10 @@ def parse_args(argv=None):
     parser.add_argument("--multipv", "--multi-pv", dest="multipv",
                         type=int, default=5,
                         help="Number of candidate moves to emit as standard UCI MultiPV info lines")
+    parser.add_argument("--compute-wdl", "--compute_wdl", dest="compute_wdl",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Evaluate candidate moves to report UCI wdl lines. Costs one extra model forward; "
+                             "disable it when the client only needs the best move")
     parser.add_argument("--use-uci-history", "--use_uci_history", dest="use_uci_history", action="store_true", default=False,
                         help="Rebuild board history from UCI 'position ... moves' commands. When off, the current position is repeated to fill history")
 
@@ -229,6 +233,7 @@ class Maia3UCIEngine:
         self.temperature = cfg.temperature
         self.top_p = cfg.top_p
         self.multipv = clamp_multipv(cfg.multipv)
+        self.compute_wdl = bool(getattr(cfg, "compute_wdl", True))
 
         self.board = chess.Board()
         self.history = deque(maxlen=cfg.history)
@@ -257,7 +262,26 @@ class Maia3UCIEngine:
 
         print(f"loading Maia3 checkpoint {self.cfg.checkpoint_path}", file=sys.stderr, flush=True)
         self.model = load_model(self.cfg)
+        self._warmup()
         print("Maia3 ready", file=sys.stderr, flush=True)
+
+    @torch.no_grad()
+    def _warmup(self):
+        """Прогреть счёт на текущей позиции.
+
+        Первый forward после загрузки заметно медленнее следующих: на CPU
+        oneDNN инициализирует ядра под нужные формы. Без прогрева эту
+        задержку оплачивает первый ход, а не старт движка.
+        """
+
+        try:
+            tokens = self._tokens_from_history(self.history).unsqueeze(0).to(self.cfg.device)
+            self_elos = torch.tensor([self.self_elo], dtype=torch.long, device=self.cfg.device)
+            oppo_elos = torch.tensor([self.oppo_elo], dtype=torch.long, device=self.cfg.device)
+            with autocast('cuda', enabled=self.cfg.use_amp and self.cfg.device.startswith('cuda')):
+                self.model(tokens, self_elos, oppo_elos)
+        except Exception as exc:
+            print(f"warning: Maia3 warmup failed: {exc}", file=sys.stderr, flush=True)
 
     def _reset_history(self):
         self.history.clear()
@@ -332,7 +356,7 @@ class Maia3UCIEngine:
             if top_move is not None:
                 top_moves.append({"move": top_move, "policy": prob, "wdl": (0, 1000, 0)})
 
-        if top_moves:
+        if top_moves and self.compute_wdl:
             candidate_tokens = torch.stack([
                 self._tokens_from_history(self._history_after_move(item["move"]))
                 for item in top_moves
@@ -465,13 +489,21 @@ class Maia3UCIEngine:
         self.ensure_model_loaded()
         move, top_moves = self.score_moves()
         for rank, item in enumerate(top_moves, start=1):
-            win, draw, loss = item["wdl"]
-            cp = cp_from_wdl(item["wdl"])
-            print(
-                f"info depth 1 multipv {rank} score cp {cp} wdl {win} {draw} {loss} "
-                f"pv {item['move'].uci()}",
-                flush=True,
-            )
+            if self.compute_wdl:
+                win, draw, loss = item["wdl"]
+                cp = cp_from_wdl(item["wdl"])
+                print(
+                    f"info depth 1 multipv {rank} score cp {cp} wdl {win} {draw} {loss} "
+                    f"pv {item['move'].uci()}",
+                    flush=True,
+                )
+            else:
+                # Без WDL оценки хода нет - сообщаем только линию, чтобы не
+                # выдавать клиенту выдуманный score.
+                print(
+                    f"info depth 1 multipv {rank} pv {item['move'].uci()}",
+                    flush=True,
+                )
 
         if "infinite" in line.split():
             self.pending_bestmove = move
